@@ -22,6 +22,10 @@
 extern crate alloc;
 
 use alloc::{vec, vec::Vec};
+use ecdsa::{signature::DigestVerifier, Signature, VerifyingKey};
+use p256::NistP256;
+use rsa::{pkcs1::DecodeRsaPublicKey, PaddingScheme, PublicKey};
+use sha2::{Digest, Sha256, Sha384};
 
 /// Describes a CT log
 ///
@@ -158,13 +162,44 @@ const SCT_V1: u8 = 0u8;
 const SCT_TIMESTAMP: u8 = 0u8;
 const SCT_X509_ENTRY: [u8; 2] = [0, 0];
 
+type Verifier = alloc::boxed::Box<dyn FnOnce(&[u8], &[u8], &[u8]) -> Result<(), Error>>;
+
 impl<'a> Sct<'a> {
     fn verify(&self, key: &[u8], cert: &[u8]) -> Result<(), Error> {
-        let alg: &dyn ring::signature::VerificationAlgorithm = match self.sig_alg {
-            ECDSA_SHA256 => &ring::signature::ECDSA_P256_SHA256_ASN1,
-            ECDSA_SHA384 => &ring::signature::ECDSA_P384_SHA384_ASN1,
-            RSA_PKCS1_SHA256 => &ring::signature::RSA_PKCS1_2048_8192_SHA256,
-            RSA_PKCS1_SHA384 => &ring::signature::RSA_PKCS1_2048_8192_SHA384,
+        let verifier: Verifier = match self.sig_alg {
+            ECDSA_SHA256 => alloc::boxed::Box::new(|key, sig, data| {
+                let key = VerifyingKey::<NistP256>::from_sec1_bytes(key)
+                    .map_err(|_| Error::InvalidSignature)?;
+                let signature = Signature::from_der(sig).map_err(|_| Error::InvalidSignature)?;
+
+                key.verify_digest(Sha256::new().chain_update(data), &signature)
+                    .map_err(|_| Error::InvalidSignature)
+            }),
+            RSA_PKCS1_SHA256 => alloc::boxed::Box::new(|key, sig, data| {
+                let key =
+                    rsa::RsaPublicKey::from_pkcs1_der(key).map_err(|_| Error::InvalidSignature)?;
+                key.verify(
+                    PaddingScheme::PKCS1v15Sign {
+                        hash: Some(rsa::Hash::SHA2_256),
+                    },
+                    &Sha256::digest(data),
+                    sig,
+                )
+                .map_err(|_| Error::InvalidSignature)
+            }),
+            RSA_PKCS1_SHA384 => alloc::boxed::Box::new(|key, sig, data| {
+                let key =
+                    rsa::RsaPublicKey::from_pkcs1_der(key).map_err(|_| Error::InvalidSignature)?;
+                key.verify(
+                    PaddingScheme::PKCS1v15Sign {
+                        hash: Some(rsa::Hash::SHA2_384),
+                    },
+                    &Sha384::digest(data),
+                    sig,
+                )
+                .map_err(|_| Error::InvalidSignature)
+            }),
+            ECDSA_SHA384 => return Err(Error::InvalidSignature), // RustCrypto has no P-384 implementation with actual arithmetric
             _ => return Err(Error::InvalidSignature),
         };
 
@@ -176,26 +211,19 @@ impl<'a> Sct<'a> {
         write_u16(self.exts.len() as u16, &mut data);
         data.extend_from_slice(self.exts);
 
-        let key = ring::signature::UnparsedPublicKey::new(alg, key);
-
-        key.verify(&data, self.sig)
-            .map_err(|_| Error::InvalidSignature)
+        verifier(key, self.sig, &data)
     }
 
     fn parse(enc: &'a [u8]) -> Result<Sct<'a>, Error> {
         let inp = untrusted::Input::from(enc);
 
         inp.read_all(Error::MalformedSct, |rd| {
-            let version = rd
-                .read_byte()
-                .map_err(|_| Error::MalformedSct)?;
+            let version = rd.read_byte().map_err(|_| Error::MalformedSct)?;
             if version != 0 {
                 return Err(Error::UnsupportedSctVersion);
             }
 
-            let id = rd
-                .read_bytes(32)
-                .map_err(|_| Error::MalformedSct)?;
+            let id = rd.read_bytes(32).map_err(|_| Error::MalformedSct)?;
             let timestamp = rd
                 .read_bytes(8)
                 .map_err(|_| Error::MalformedSct)
@@ -243,7 +271,7 @@ impl<'a> Sct<'a> {
 /// Otherwise, it returns an `Error`.
 pub fn verify_sct(cert: &[u8], sct: &[u8], at_time: u64, logs: &[&Log]) -> Result<usize, Error> {
     let sct = Sct::parse(sct)?;
-    let i = lookup(logs, &sct.log_id)?;
+    let i = lookup(logs, sct.log_id)?;
     let log = logs[i];
     sct.verify(log.key, cert)?;
 
